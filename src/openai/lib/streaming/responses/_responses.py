@@ -24,6 +24,7 @@ from ....types.responses import (
     ResponseOutputItemDoneEvent,
     ResponseOutputItemAddedEvent,
 )
+from ...._streaming_cleanup import close_owned, run_cleanup, aclose_owned
 from ..._parsing._responses import TextFormatT, parse_text, parse_response
 from ....types.responses.tool_param import ToolParam
 from ....types.responses.parsed_response import (
@@ -54,8 +55,7 @@ class ResponseStream(Generic[TextFormatT]):
         return self._iterator.__next__()
 
     def __iter__(self) -> Iterator[ResponseStreamEvent[TextFormatT]]:
-        for item in self._iterator:
-            yield item
+        return self._iterator
 
     def __enter__(self) -> Self:
         return self
@@ -73,7 +73,8 @@ class ResponseStream(Generic[TextFormatT]):
         exc: BaseException | None,
         exc_tb: TracebackType | None,
     ) -> None:
-        self.close()
+        # A cleanup error must not replace the exception leaving the block.
+        close_owned(self, primary=exc)
 
     def close(self) -> None:
         """
@@ -81,7 +82,10 @@ class ResponseStream(Generic[TextFormatT]):
 
         Automatically called if the response body is read to completion.
         """
-        self._response.close()
+        # Concurrent close does not cancel or join an active consumer; that consumer
+        # closes the iterator when it unwinds.
+        running = getattr(self._iterator, "gi_running", False)
+        close_owned(None if running else self._iterator, self._raw_stream, self._response)
 
     def get_final_response(self) -> ParsedResponse[TextFormatT]:
         """Waits until the stream has been read to completion and returns
@@ -134,7 +138,8 @@ class ResponseStreamManager(Generic[TextFormatT]):
         exc_tb: TracebackType | None,
     ) -> None:
         if self.__stream is not None:
-            self.__stream.close()
+            # A cleanup error must not replace the exception leaving the block.
+            close_owned(self.__stream, primary=exc)
 
 
 class AsyncResponseStream(Generic[TextFormatT]):
@@ -155,9 +160,8 @@ class AsyncResponseStream(Generic[TextFormatT]):
     async def __anext__(self) -> ResponseStreamEvent[TextFormatT]:
         return await self._iterator.__anext__()
 
-    async def __aiter__(self) -> AsyncIterator[ResponseStreamEvent[TextFormatT]]:
-        async for item in self._iterator:
-            yield item
+    def __aiter__(self) -> AsyncIterator[ResponseStreamEvent[TextFormatT]]:
+        return self._iterator
 
     async def __stream__(self) -> AsyncIterator[ResponseStreamEvent[TextFormatT]]:
         async for sse_event in self._raw_stream:
@@ -175,7 +179,8 @@ class AsyncResponseStream(Generic[TextFormatT]):
         exc: BaseException | None,
         exc_tb: TracebackType | None,
     ) -> None:
-        await self.close()
+        # A cleanup error must not replace the exception leaving the block.
+        await run_cleanup(self.close, primary=exc)
 
     async def close(self) -> None:
         """
@@ -183,7 +188,10 @@ class AsyncResponseStream(Generic[TextFormatT]):
 
         Automatically called if the response body is read to completion.
         """
-        await self._response.aclose()
+        # Concurrent close does not cancel or join an active consumer; that consumer
+        # closes the iterator when it unwinds.
+        running = getattr(self._iterator, "ag_running", False)
+        await aclose_owned(None if running else self._iterator, self._raw_stream, self._response)
 
     async def get_final_response(self) -> ParsedResponse[TextFormatT]:
         """Waits until the stream has been read to completion and returns
@@ -236,7 +244,8 @@ class AsyncResponseStreamManager(Generic[TextFormatT]):
         exc_tb: TracebackType | None,
     ) -> None:
         if self.__stream is not None:
-            await self.__stream.close()
+            # A cleanup error must not replace the exception leaving the block.
+            await run_cleanup(self.__stream.close, primary=exc)
 
 
 def _output_identity(

@@ -6,6 +6,7 @@ from typing_extensions import Self, override
 from ._result import OutputT, AgentTurnResult, AgentTurnResultError, AgentOutputParseError, AgentTurnResultCollection
 from ...._compat import cached_property
 from ...._streaming import Stream, AsyncStream
+from ...._streaming_cleanup import close_owned, aclose_owned
 from ...streaming.agents._dispatch import ToolDispatcher, AsyncToolDispatcher
 from ....types.beta.agent_session_event import AgentSessionEvent
 
@@ -26,8 +27,10 @@ class AgentSessionEventStream(Stream[AgentSessionEvent], Generic[OutputT]):
 
     @override
     def __stream__(self) -> Iterator[AgentSessionEvent]:
+        events = super().__stream__()
+        failure: BaseException | None = None
         try:
-            for event in super().__stream__():
+            for event in events:
                 self._collection.accept(event)
                 pending = self._dispatcher.prepare(event) if self._dispatcher is not None else None
                 yield event
@@ -35,9 +38,15 @@ class AgentSessionEventStream(Stream[AgentSessionEvent], Generic[OutputT]):
                     self._dispatcher.dispatch(pending)
         except Exception as error:
             self._collection.record_error(error)
+            failure = error
+            raise
+        except GeneratorExit:
+            raise  # Normal closure, not a failure that should outrank cleanup errors.
+        except BaseException as error:
+            failure = error
             raise
         finally:
-            self.close()
+            close_owned(events, self, primary=failure)
 
     def with_result_collection(self) -> Self:
         """Beta: retain final messages for a result; call before consuming events."""
@@ -53,21 +62,27 @@ class AgentSessionEventStream(Stream[AgentSessionEvent], Generic[OutputT]):
         the cached result without consuming more events.
         """
         collector = self._collection.enable()
+        failure: BaseException | None = None
         try:
-            collector.check_outcome(self._dispatcher.handlers if self._dispatcher is not None else ())
-            if not collector.is_done():
-                for _ in self:
-                    collector.check_outcome(self._dispatcher.handlers if self._dispatcher is not None else ())
-                    if collector.is_done():
-                        break
-            return self._collection.result()
-        except (AgentTurnResultError, AgentOutputParseError):
+            try:
+                collector.check_outcome(self._dispatcher.handlers if self._dispatcher is not None else ())
+                if not collector.is_done():
+                    for _ in self:
+                        collector.check_outcome(self._dispatcher.handlers if self._dispatcher is not None else ())
+                        if collector.is_done():
+                            break
+                return self._collection.result()
+            except (AgentTurnResultError, AgentOutputParseError):
+                raise
+            except Exception as error:
+                collector.cause = error
+                raise collector.error("observation_failed") from error
+        except BaseException as error:
+            failure = error
             raise
-        except Exception as error:
-            collector.cause = error
-            raise collector.error("observation_failed") from error
         finally:
-            self.close()
+            # A cleanup error must not replace the result error being raised.
+            close_owned(self, primary=failure)
 
 
 class AsyncAgentSessionEventStream(AsyncStream[AgentSessionEvent], Generic[OutputT]):
@@ -81,8 +96,10 @@ class AsyncAgentSessionEventStream(AsyncStream[AgentSessionEvent], Generic[Outpu
 
     @override
     async def __stream__(self) -> AsyncIterator[AgentSessionEvent]:
+        events = super().__stream__()
+        failure: BaseException | None = None
         try:
-            async for event in super().__stream__():
+            async for event in events:
                 self._collection.accept(event)
                 pending = self._dispatcher.prepare(event) if self._dispatcher is not None else None
                 yield event
@@ -90,9 +107,15 @@ class AsyncAgentSessionEventStream(AsyncStream[AgentSessionEvent], Generic[Outpu
                     await self._dispatcher.dispatch(pending)
         except Exception as error:
             self._collection.record_error(error)
+            failure = error
+            raise
+        except GeneratorExit:
+            raise  # Normal closure, not a failure that should outrank cleanup errors.
+        except BaseException as error:
+            failure = error
             raise
         finally:
-            await self.close()
+            await aclose_owned(events, self, primary=failure)
 
     def with_result_collection(self) -> Self:
         """Beta: retain final messages for a result; call before consuming events."""
@@ -106,18 +129,24 @@ class AsyncAgentSessionEventStream(AsyncStream[AgentSessionEvent], Generic[Outpu
         with_result_collection() before consuming events.
         """
         collector = self._collection.enable()
+        failure: BaseException | None = None
         try:
-            collector.check_outcome(self._dispatcher.handlers if self._dispatcher is not None else ())
-            if not collector.is_done():
-                async for _ in self:
-                    collector.check_outcome(self._dispatcher.handlers if self._dispatcher is not None else ())
-                    if collector.is_done():
-                        break
-            return self._collection.result()
-        except (AgentTurnResultError, AgentOutputParseError):
+            try:
+                collector.check_outcome(self._dispatcher.handlers if self._dispatcher is not None else ())
+                if not collector.is_done():
+                    async for _ in self:
+                        collector.check_outcome(self._dispatcher.handlers if self._dispatcher is not None else ())
+                        if collector.is_done():
+                            break
+                return self._collection.result()
+            except (AgentTurnResultError, AgentOutputParseError):
+                raise
+            except Exception as error:
+                collector.cause = error
+                raise collector.error("observation_failed") from error
+        except BaseException as error:
+            failure = error
             raise
-        except Exception as error:
-            collector.cause = error
-            raise collector.error("observation_failed") from error
         finally:
-            await self.close()
+            # A cleanup error must not replace the result error being raised.
+            await aclose_owned(self, primary=failure)

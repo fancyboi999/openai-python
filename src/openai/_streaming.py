@@ -13,7 +13,7 @@ import httpx2
 from ._utils import is_mapping, extract_type_var_from_base
 from ._httpx2 import request_exceptions, timeout_exceptions
 from ._exceptions import APIError, APITimeoutError, APIConnectionError
-from ._streaming_cleanup import drain_response_async
+from ._streaming_cleanup import close_owned, run_cleanup, aclose_owned, drain_response_async
 
 if TYPE_CHECKING:
     from ._client import OpenAI, AsyncOpenAI
@@ -49,22 +49,39 @@ class Stream(Generic[_T]):
         return self._iterator.__next__()
 
     def __iter__(self) -> Iterator[_T]:
-        for item in self._iterator:
-            yield item
+        return self._iterator
 
     def _iter_events(self) -> Iterator[ServerSentEvent]:
+        chunks: Optional[Iterator[bytes]] = None
+        events: Optional[Iterator[ServerSentEvent]] = None
+        failure: Optional[BaseException] = None
         try:
-            yield from self._decoder.iter_bytes(self.response.iter_bytes())
-        except timeout_exceptions() as err:
-            raise APITimeoutError(request=self.response.request) from err
-        except request_exceptions() as err:
-            raise APIConnectionError(request=self.response.request) from err
+            try:
+                chunks = self.response.iter_bytes()
+                events = self._decoder.iter_bytes(chunks)
+                # Not `yield from`: it would close `events` itself, and the
+                # cleanup below must stay the only close.
+                for sse in events:
+                    yield sse
+            except timeout_exceptions() as err:
+                raise APITimeoutError(request=self.response.request) from err
+            except request_exceptions() as err:
+                raise APIConnectionError(request=self.response.request) from err
+        except GeneratorExit:
+            raise  # Normal closure, not a failure that should outrank cleanup errors.
+        except BaseException as err:
+            failure = err
+            raise
+        finally:
+            # Close the iterators opened here; stopping early does not close them.
+            close_owned(events, chunks, primary=failure)
 
     def __stream__(self) -> Iterator[_T]:
         cast_to = cast(Any, self._cast_to)
         response = self.response
         process_data = self._client._process_response_data
         iterator = self._iter_events()
+        failure: Optional[BaseException] = None
 
         try:
             for sse in iterator:
@@ -113,9 +130,15 @@ class Stream(Generic[_T]):
                         cast_to=cast_to,
                         response=response,
                     )
+        except GeneratorExit:
+            raise  # Normal closure, not a failure that should outrank cleanup errors.
+        except BaseException as err:
+            failure = err
+            raise
         finally:
-            # Ensure the response is closed even if the consumer doesn't read all data
-            response.close()
+            # Close the event iterator explicitly; stopping at [DONE] leaves it suspended.
+            # Ensure the response is closed even if the consumer doesn't read all data.
+            close_owned(iterator, response, primary=failure)
 
     def __enter__(self) -> Self:
         return self
@@ -126,7 +149,8 @@ class Stream(Generic[_T]):
         exc: BaseException | None,
         exc_tb: TracebackType | None,
     ) -> None:
-        self.close()
+        # A cleanup error must not replace the exception leaving the block.
+        close_owned(self, primary=exc)
 
     def close(self) -> None:
         """
@@ -134,7 +158,10 @@ class Stream(Generic[_T]):
 
         Automatically called if the response body is read to completion.
         """
-        self.response.close()
+        # Concurrent close does not cancel or join an active consumer; that consumer
+        # closes the iterator when it unwinds.
+        running = getattr(self._iterator, "gi_running", False)
+        close_owned(None if running else self._iterator, self.response)
 
 
 class AsyncStream(Generic[_T]):
@@ -162,24 +189,38 @@ class AsyncStream(Generic[_T]):
     async def __anext__(self) -> _T:
         return await self._iterator.__anext__()
 
-    async def __aiter__(self) -> AsyncIterator[_T]:
-        async for item in self._iterator:
-            yield item
+    def __aiter__(self) -> AsyncIterator[_T]:
+        return self._iterator
 
     async def _iter_events(self) -> AsyncIterator[ServerSentEvent]:
+        chunks: Optional[AsyncIterator[bytes]] = None
+        events: Optional[AsyncIterator[ServerSentEvent]] = None
+        failure: Optional[BaseException] = None
         try:
-            async for sse in self._decoder.aiter_bytes(self.response.aiter_bytes()):
-                yield sse
-        except timeout_exceptions() as err:
-            raise APITimeoutError(request=self.response.request) from err
-        except request_exceptions() as err:
-            raise APIConnectionError(request=self.response.request) from err
+            try:
+                chunks = self.response.aiter_bytes()
+                events = self._decoder.aiter_bytes(chunks)
+                async for sse in events:
+                    yield sse
+            except timeout_exceptions() as err:
+                raise APITimeoutError(request=self.response.request) from err
+            except request_exceptions() as err:
+                raise APIConnectionError(request=self.response.request) from err
+        except GeneratorExit:
+            raise  # Normal closure, not a failure that should outrank cleanup errors.
+        except BaseException as err:
+            failure = err
+            raise
+        finally:
+            # Close the iterators opened here; an interrupted `async for` does not.
+            await aclose_owned(events, chunks, primary=failure)
 
     async def __stream__(self) -> AsyncIterator[_T]:
         cast_to = cast(Any, self._cast_to)
         response = self.response
         process_data = self._client._process_response_data
         iterator = self._iter_events()
+        failure: Optional[BaseException] = None
 
         try:
             async for sse in iterator:
@@ -233,9 +274,17 @@ class AsyncStream(Generic[_T]):
                         cast_to=cast_to,
                         response=response,
                     )
+        except GeneratorExit:
+            raise  # Normal closure, not a failure that should outrank cleanup errors.
+        except BaseException as err:
+            failure = err
+            raise
         finally:
-            # Ensure the response is closed even if the consumer doesn't read all data
-            await response.aclose()
+            # Close the event iterator explicitly. Stopping at [DONE] leaves it and the
+            # httpx2 byte iterators beneath it suspended; left to the garbage collector,
+            # asyncio closes those nested generators concurrently.
+            # Ensure the response is closed even if the consumer doesn't read all data.
+            await aclose_owned(iterator, response, primary=failure)
 
     async def __aenter__(self) -> Self:
         return self
@@ -246,7 +295,8 @@ class AsyncStream(Generic[_T]):
         exc: BaseException | None,
         exc_tb: TracebackType | None,
     ) -> None:
-        await self.close()
+        # A cleanup error must not replace the exception leaving the block.
+        await run_cleanup(self.close, primary=exc)
 
     async def close(self) -> None:
         """
@@ -254,7 +304,10 @@ class AsyncStream(Generic[_T]):
 
         Automatically called if the response body is read to completion.
         """
-        await self.response.aclose()
+        # Concurrent close does not cancel or join an active consumer; that consumer
+        # closes the iterator when it unwinds.
+        running = getattr(self._iterator, "ag_running", False)
+        await aclose_owned(None if running else self._iterator, self.response)
 
     async def aclose(self) -> None:
         """Close the response and release the connection. Alias for `close()`."""

@@ -6,9 +6,11 @@ from typing_extensions import override
 
 import httpx2
 import pytest
+from pydantic import BaseModel
 
 from openai import OpenAI, AsyncOpenAI
-from openai.lib.beta.agents import AgentTurnResult, AgentTurnResultError
+from openai._streaming import SSEDecoder
+from openai.lib.beta.agents import AgentTurnResult, AgentTurnResultError, AgentOutputParseError
 from openai.lib.streaming.agents import AgentSessionStream, AsyncAgentSessionStream
 from tests.lib.streaming.agents.test_streams import Server, EventBody, sdk as sdk, call, idle, session, turn_event
 
@@ -193,6 +195,183 @@ async def test_unsuccessful_turn(sdk: OpenAI | AsyncOpenAI, server: ResultServer
     assert exc.value.turn_id == "turn_root"
     assert exc.value.messages[0].output_text == "answer"
     assert server.body.closed
+
+
+class _CloseFailingDecoder(SSEDecoder):
+    """Decodes normally; closing its event iterator fails."""
+
+    class _Events:
+        def __init__(self, inner: Any) -> None:
+            self._inner = inner
+
+        def __iter__(self) -> Any:
+            return self
+
+        def __next__(self) -> Any:
+            return next(self._inner)
+
+        def __aiter__(self) -> Any:
+            return self
+
+        async def __anext__(self) -> Any:
+            return await self._inner.__anext__()
+
+        def close(self) -> None:
+            raise RuntimeError("decoder close failed")
+
+        async def aclose(self) -> None:
+            raise RuntimeError("decoder close failed")
+
+    @override
+    def iter_bytes(self, iterator: Iterator[bytes]) -> Any:
+        return self._Events(super().iter_bytes(iterator))
+
+    @override
+    def aiter_bytes(self, iterator: Any) -> Any:
+        return self._Events(super().aiter_bytes(iterator))
+
+
+async def test_cleanup_error_does_not_replace_result_error(
+    sdk: OpenAI | AsyncOpenAI, server: ResultServer, creation: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sdk, "_make_sse_decoder", lambda: _CloseFailingDecoder())
+    server.body = EventBody([turn_event("created"), message(), turn_event("failed"), idle()])
+    with pytest.raises(AgentTurnResultError) as exc:
+        await collect(sdk, creation)
+    assert exc.value.reason == "failed"
+
+
+async def _final_result_through_stream(sdk: OpenAI | AsyncOpenAI, **kwargs: Any) -> Any:
+    if isinstance(sdk, AsyncOpenAI):
+        async with sdk.beta.agents.sessions.stream("session_test", input="Question", **kwargs) as async_stream:
+            return await async_stream.get_final_result()
+    with sdk.beta.agents.sessions.stream("session_test", input="Question", **kwargs) as stream:
+        return stream.get_final_result()
+
+
+async def test_terminal_cleanup_error_does_not_replace_failed_session(
+    sdk: OpenAI | AsyncOpenAI, server: ResultServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sdk, "_make_sse_decoder", lambda: _CloseFailingDecoder())
+    server.body = EventBody(
+        [turn_event("created"), message(), {"type": "agent.session.failed", "session": session("failed")}]
+    )
+    with pytest.raises(AgentTurnResultError) as exc:
+        await _final_result_through_stream(sdk)
+    assert exc.value.reason == "failed"
+
+
+async def test_terminal_cleanup_error_does_not_replace_parse_error(
+    sdk: OpenAI | AsyncOpenAI, server: ResultServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Summary(BaseModel):
+        summary: str
+
+    monkeypatch.setattr(sdk, "_make_sse_decoder", lambda: _CloseFailingDecoder())
+    server.body = EventBody([turn_event("created"), message("not json"), turn_event("completed"), idle()])
+    with pytest.raises(AgentOutputParseError):
+        await _final_result_through_stream(sdk, output_type=Summary)
+
+
+async def test_terminal_cleanup_error_surfaces_after_successful_result(
+    sdk: OpenAI | AsyncOpenAI, server: ResultServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sdk, "_make_sse_decoder", lambda: _CloseFailingDecoder())
+    server.body = EventBody([turn_event("created"), message(), turn_event("completed"), idle()])
+    with pytest.raises(RuntimeError, match="decoder close failed"):
+        await _final_result_through_stream(sdk)
+
+
+@pytest.mark.parametrize("consume", ["iterate", "until_done", "close_after_terminal"])
+async def test_terminal_cleanup_error_surfaces_once_without_result(
+    sdk: OpenAI | AsyncOpenAI, server: ResultServer, monkeypatch: pytest.MonkeyPatch, consume: str
+) -> None:
+    monkeypatch.setattr(sdk, "_make_sse_decoder", lambda: _CloseFailingDecoder())
+    server.body = EventBody([turn_event("created"), message(), turn_event("completed"), idle()])
+    raised = 0
+    if isinstance(sdk, AsyncOpenAI):
+        async_stream = sdk.beta.agents.sessions.stream("session_test", input="Question")
+        try:
+            async with async_stream:
+                if consume == "iterate":
+                    async for _ in async_stream:
+                        pass
+                elif consume == "until_done":
+                    await async_stream.until_done()
+                else:
+                    async for event in async_stream:
+                        if event.type == "agent.session.idle":
+                            break
+        except RuntimeError as error:
+            assert str(error) == "decoder close failed"
+            raised += 1
+        await async_stream.close()  # Delivered once; a later close does not raise again.
+    else:
+        stream = sdk.beta.agents.sessions.stream("session_test", input="Question")
+        try:
+            with stream:
+                if consume == "iterate":
+                    for _ in stream:
+                        pass
+                elif consume == "until_done":
+                    stream.until_done()
+                else:
+                    for event in stream:
+                        if event.type == "agent.session.idle":
+                            break
+        except RuntimeError as error:
+            assert str(error) == "decoder close failed"
+            raised += 1
+        stream.close()
+    assert raised == 1
+
+
+async def test_context_exception_wins_over_terminal_cleanup_error(
+    sdk: OpenAI | AsyncOpenAI, server: ResultServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sdk, "_make_sse_decoder", lambda: _CloseFailingDecoder())
+    server.body = EventBody([turn_event("created"), message(), turn_event("completed"), idle()])
+    with pytest.raises(KeyError, match="caller"):
+        if isinstance(sdk, AsyncOpenAI):
+            async with sdk.beta.agents.sessions.stream("session_test", input="Question") as async_stream:
+                async for event in async_stream:
+                    if event.type == "agent.session.idle":
+                        raise KeyError("caller")
+        else:
+            with sdk.beta.agents.sessions.stream("session_test", input="Question") as stream:
+                for event in stream:
+                    if event.type == "agent.session.idle":
+                        raise KeyError("caller")
+
+
+async def test_pre_terminal_context_exception_wins_over_cleanup_error(
+    sdk: OpenAI | AsyncOpenAI, server: ResultServer, creation: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sdk, "_make_sse_decoder", lambda: _CloseFailingDecoder())
+    server.body = EventBody([turn_event("created"), message(), turn_event("completed"), idle()])
+    with pytest.raises(KeyError, match="caller"):
+        if isinstance(sdk, AsyncOpenAI):
+            async_stream = (
+                await sdk.beta.agents.sessions.create(
+                    agent={"model": "test-model"}, environment={"type": "none"}, input="Question", stream=True
+                )
+                if creation
+                else sdk.beta.agents.sessions.stream("session_test", input="Question")
+            )
+            async with async_stream:
+                async for _ in async_stream:
+                    raise KeyError("caller")
+        else:
+            stream = (
+                sdk.beta.agents.sessions.create(
+                    agent={"model": "test-model"}, environment={"type": "none"}, input="Question", stream=True
+                )
+                if creation
+                else sdk.beta.agents.sessions.stream("session_test", input="Question")
+            )
+            with stream:
+                for _ in stream:
+                    raise KeyError("caller")
 
 
 @pytest.mark.parametrize("tail", [[], [turn_event("completed")]])

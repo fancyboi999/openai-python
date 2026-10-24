@@ -12,6 +12,7 @@ from ._types import ToolHandler, AsyncToolHandler
 from ...._types import Omit, Headers, NotGiven, omit, not_given
 from ._dispatch import ToolDispatcher, AsyncToolDispatcher, _request_options
 from ...._streaming import Stream, AsyncStream
+from ...._streaming_cleanup import close_owned, run_cleanup, aclose_owned
 from ...beta.agents._result import (
     OutputT,
     AgentTurnResult,
@@ -131,6 +132,7 @@ class AgentSessionStream(Generic[OutputT]):
         self._iterator: Iterator[AgentSessionEvent] | None = None
         self._entered = False
         self._closed = False
+        self._deferred_cleanup_error: BaseException | None = None
 
     def __enter__(self) -> Self:
         if self._entered or self._closed:
@@ -146,8 +148,8 @@ class AgentSessionStream(Generic[OutputT]):
             self._sessions.events.create(
                 self._session_id, events=[self._input], idempotency_key=self._idempotency_key, **self._options
             )
-        except BaseException:
-            self.close()
+        except BaseException as error:
+            close_owned(self, primary=error)
             raise
         self._iterator = self._iterate()
         return self
@@ -155,13 +157,16 @@ class AgentSessionStream(Generic[OutputT]):
     def __exit__(
         self, exc_type: type[BaseException] | None, exc: BaseException | None, exc_tb: TracebackType | None
     ) -> None:
-        self.close()
+        if exc is not None:
+            self._deferred_cleanup_error = None  # The propagating exception wins.
+        close_owned(self, primary=exc)
 
     def __iter__(self) -> Self:
         return self
 
     def __next__(self) -> AgentSessionEvent:
         if self._closed:
+            self._raise_deferred_cleanup_error()
             raise StopIteration
         if self._iterator is None:
             raise RuntimeError("Use sessions.stream in a with block")
@@ -186,30 +191,50 @@ class AgentSessionStream(Generic[OutputT]):
         To iterate first, call with_result_collection() before consuming events.
         """
         collector = self._collection.enable()
+        failure: BaseException | None = None
         try:
-            collector.check_outcome(self._handlers)
-            if not collector.is_done():
-                for _ in self:
-                    collector.check_outcome(self._handlers)
-                    if collector.is_done():
-                        break
-            return self._collection.result()
-        except (AgentTurnResultError, AgentOutputParseError):
+            try:
+                collector.check_outcome(self._handlers)
+                if not collector.is_done():
+                    for _ in self:
+                        collector.check_outcome(self._handlers)
+                        if collector.is_done():
+                            break
+                result = self._collection.result()
+            except (AgentTurnResultError, AgentOutputParseError):
+                raise
+            except Exception as error:
+                self._collection.record_error(error)
+                raise collector.error("observation_failed") from error
+            # The outcome is established; a terminal cleanup failure may surface now.
+            self._raise_deferred_cleanup_error()
+            return result
+        except BaseException as error:
+            failure = error
             raise
-        except Exception as error:
-            self._collection.record_error(error)
-            raise collector.error("observation_failed") from error
         finally:
-            self.close()
+            # A cleanup error must not replace the result error being raised.
+            if failure is not None:
+                self._deferred_cleanup_error = None
+            close_owned(self, primary=failure)
 
     def close(self) -> None:
         """Close the event connection without cancelling the backend turn."""
         self._closed = True
-        if self._stream is not None:
-            self._stream.close()
+        # Concurrent close does not cancel or join an active consumer; that consumer
+        # closes the iterator when it unwinds.
+        running = getattr(self._iterator, "gi_running", False)
+        close_owned(None if running else self._iterator, self._stream)
+        self._raise_deferred_cleanup_error()
+
+    def _raise_deferred_cleanup_error(self) -> None:
+        error, self._deferred_cleanup_error = self._deferred_cleanup_error, None
+        if error is not None:
+            raise error
 
     def _iterate(self) -> Iterator[AgentSessionEvent]:
         assert self._stream is not None
+        failure: BaseException | None = None
         try:
             for event in self._stream:
                 if not self._state.accept(event):
@@ -217,19 +242,31 @@ class AgentSessionStream(Generic[OutputT]):
                 self._collection.accept(event)
                 terminal = self._state.terminal(event)
                 if terminal:
-                    self.close()
+                    # Close now, but report a cleanup failure only after this terminal
+                    # event's outcome has been evaluated.
+                    try:
+                        self.close()
+                    except Exception as error:
+                        self._deferred_cleanup_error = error
                 pending = self._dispatcher.prepare(event)
                 yield event
                 if terminal or self._closed:
+                    self._raise_deferred_cleanup_error()
                     return
                 if pending is not None:
                     self._dispatcher.dispatch(pending)
             raise RuntimeError("Session event stream ended before the turn reached idle or failed")
         except Exception as error:
             self._collection.record_error(error)
+            failure = error
+            raise
+        except GeneratorExit:
+            raise  # Normal closure, not a failure that should outrank cleanup errors.
+        except BaseException as error:
+            failure = error
             raise
         finally:
-            self.close()
+            close_owned(self, primary=failure)
 
 
 class AsyncAgentSessionStream(Generic[OutputT]):
@@ -269,6 +306,7 @@ class AsyncAgentSessionStream(Generic[OutputT]):
         self._iterator: AsyncIterator[AgentSessionEvent] | None = None
         self._entered = False
         self._closed = False
+        self._deferred_cleanup_error: BaseException | None = None
 
     async def __aenter__(self) -> Self:
         if self._entered or self._closed:
@@ -284,8 +322,8 @@ class AsyncAgentSessionStream(Generic[OutputT]):
             await self._sessions.events.create(
                 self._session_id, events=[self._input], idempotency_key=self._idempotency_key, **self._options
             )
-        except BaseException:
-            await self.close()
+        except BaseException as error:
+            await run_cleanup(self.close, primary=error)
             raise
         self._iterator = self._iterate()
         return self
@@ -293,13 +331,16 @@ class AsyncAgentSessionStream(Generic[OutputT]):
     async def __aexit__(
         self, exc_type: type[BaseException] | None, exc: BaseException | None, exc_tb: TracebackType | None
     ) -> None:
-        await self.close()
+        if exc is not None:
+            self._deferred_cleanup_error = None  # The propagating exception wins.
+        await run_cleanup(self.close, primary=exc)
 
     def __aiter__(self) -> Self:
         return self
 
     async def __anext__(self) -> AgentSessionEvent:
         if self._closed:
+            self._raise_deferred_cleanup_error()
             raise StopAsyncIteration
         if self._iterator is None:
             raise RuntimeError("Use sessions.stream in an async with block")
@@ -324,30 +365,50 @@ class AsyncAgentSessionStream(Generic[OutputT]):
         To iterate first, call with_result_collection() before consuming events.
         """
         collector = self._collection.enable()
+        failure: BaseException | None = None
         try:
-            collector.check_outcome(self._handlers)
-            if not collector.is_done():
-                async for _ in self:
-                    collector.check_outcome(self._handlers)
-                    if collector.is_done():
-                        break
-            return self._collection.result()
-        except (AgentTurnResultError, AgentOutputParseError):
+            try:
+                collector.check_outcome(self._handlers)
+                if not collector.is_done():
+                    async for _ in self:
+                        collector.check_outcome(self._handlers)
+                        if collector.is_done():
+                            break
+                result = self._collection.result()
+            except (AgentTurnResultError, AgentOutputParseError):
+                raise
+            except Exception as error:
+                self._collection.record_error(error)
+                raise collector.error("observation_failed") from error
+            # The outcome is established; a terminal cleanup failure may surface now.
+            self._raise_deferred_cleanup_error()
+            return result
+        except BaseException as error:
+            failure = error
             raise
-        except Exception as error:
-            self._collection.record_error(error)
-            raise collector.error("observation_failed") from error
         finally:
-            await self.close()
+            # A cleanup error must not replace the result error being raised.
+            if failure is not None:
+                self._deferred_cleanup_error = None
+            await run_cleanup(self.close, primary=failure)
 
     async def close(self) -> None:
         """Close the event connection without cancelling the backend turn."""
         self._closed = True
-        if self._stream is not None:
-            await self._stream.close()
+        # Concurrent close does not cancel or join an active consumer; that consumer
+        # closes the iterator when it unwinds.
+        running = getattr(self._iterator, "ag_running", False)
+        await aclose_owned(None if running else self._iterator, self._stream)
+        self._raise_deferred_cleanup_error()
+
+    def _raise_deferred_cleanup_error(self) -> None:
+        error, self._deferred_cleanup_error = self._deferred_cleanup_error, None
+        if error is not None:
+            raise error
 
     async def _iterate(self) -> AsyncIterator[AgentSessionEvent]:
         assert self._stream is not None
+        failure: BaseException | None = None
         try:
             async for event in self._stream:
                 if not self._state.accept(event):
@@ -355,16 +416,28 @@ class AsyncAgentSessionStream(Generic[OutputT]):
                 self._collection.accept(event)
                 terminal = self._state.terminal(event)
                 if terminal:
-                    await self.close()
+                    # Close now, but report a cleanup failure only after this terminal
+                    # event's outcome has been evaluated.
+                    try:
+                        await self.close()
+                    except Exception as error:
+                        self._deferred_cleanup_error = error
                 pending = self._dispatcher.prepare(event)
                 yield event
                 if terminal or self._closed:
+                    self._raise_deferred_cleanup_error()
                     return
                 if pending is not None:
                     await self._dispatcher.dispatch(pending)
             raise RuntimeError("Session event stream ended before the turn reached idle or failed")
         except Exception as error:
             self._collection.record_error(error)
+            failure = error
+            raise
+        except GeneratorExit:
+            raise  # Normal closure, not a failure that should outrank cleanup errors.
+        except BaseException as error:
+            failure = error
             raise
         finally:
-            await self.close()
+            await run_cleanup(self.close, primary=failure)
