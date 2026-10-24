@@ -628,7 +628,9 @@ async def test_async_stream_closes_its_iterators(early_exit: bool, async_client:
         async for _ in stream:
             if early_exit:
                 break
-        await stream.close()
+        if early_exit:
+            await stream.close()
+        # Reading to [DONE] must clean up without an explicit close().
         del stream
         gc.collect()
 
@@ -660,16 +662,19 @@ async def test_async_chat_completion_stream_closes_raw_stream_iterators(async_cl
 class _TrackedEvents:
     """A decoder iterator that is not a generator and must be closed exactly once."""
 
-    def __init__(self, fail_after: int | None = None, close_error: bool = False) -> None:
+    def __init__(self, fail_after: int | None = None, done_after: int | None = None, close_error: bool = False) -> None:
         self.closes = 0
         self._sent = 0
         self._fail_after = fail_after
+        self._done_after = done_after
         self._close_error = close_error
 
     def _next(self) -> ServerSentEvent:
         if self._fail_after is not None and self._sent >= self._fail_after:
             raise ValueError("decoder failed")
         self._sent += 1
+        if self._done_after is not None and self._sent > self._done_after:
+            return ServerSentEvent(data="[DONE]")
         return ServerSentEvent(data='{"foo":true}')
 
     def __iter__(self) -> "_TrackedEvents":
@@ -745,6 +750,62 @@ async def test_cleanup_error_does_not_replace_stream_error(
                 pass
 
     assert events.closes == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sync", [True, False], ids=["sync", "async"])
+@pytest.mark.parametrize("ending", ["done", "close"])
+async def test_cleanup_error_surfaces_without_other_error(
+    sync: bool, ending: str, client: OpenAI, async_client: AsyncOpenAI
+) -> None:
+    # Normal closure (generator close() or [DONE]) must not hide a cleanup failure.
+    events = _TrackedEvents(done_after=1, close_error=True)
+    with pytest.raises(RuntimeError, match="close failed"):
+        if sync:
+            stream = Stream(cast_to=object, client=client, response=httpx2.Response(200, content=sse_body()))
+            stream._decoder = _TrackedDecoder(events)
+            if ending == "done":
+                for _ in stream:
+                    pass
+            else:
+                next(iter(stream))
+                stream.close()
+        else:
+            async_stream = AsyncStream(
+                cast_to=object, client=async_client, response=httpx2.Response(200, content=to_aiter(sse_body()))
+            )
+            async_stream._decoder = _TrackedDecoder(events)
+            if ending == "done":
+                async for _ in async_stream:
+                    pass
+            else:
+                await async_stream.__anext__()
+                await async_stream.close()
+
+    assert events.closes == 1
+
+
+@pytest.mark.asyncio
+async def test_aclose_owned_closes_every_resource_and_keeps_cancellation() -> None:
+    from openai._streaming_cleanup import aclose_owned
+
+    closed: list[str] = []
+
+    class Closer:
+        def __init__(self, name: str, error: BaseException | None = None) -> None:
+            self.name = name
+            self.error = error
+
+        async def aclose(self) -> None:
+            closed.append(self.name)
+            if self.error is not None:
+                raise self.error
+
+    cancelled = asyncio.CancelledError()
+    with pytest.raises(asyncio.CancelledError):
+        await aclose_owned(Closer("first", cancelled), object(), Closer("second"), primary=ValueError("primary"))
+
+    assert closed == ["first", "second"]
 
 
 async def to_aiter(iter: Iterator[bytes]) -> AsyncIterator[bytes]:

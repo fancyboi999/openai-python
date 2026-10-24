@@ -40,14 +40,13 @@ class AgentSessionEventStream(Stream[AgentSessionEvent], Generic[OutputT]):
             self._collection.record_error(error)
             failure = error
             raise
+        except GeneratorExit:
+            raise  # Normal closure, not a failure that should outrank cleanup errors.
         except BaseException as error:
             failure = error
             raise
         finally:
-            try:
-                close_owned(events, primary=failure)
-            finally:
-                self.close()
+            close_owned(events, self, primary=failure)
 
     def with_result_collection(self) -> Self:
         """Beta: retain final messages for a result; call before consuming events."""
@@ -104,14 +103,13 @@ class AsyncAgentSessionEventStream(AsyncStream[AgentSessionEvent], Generic[Outpu
             self._collection.record_error(error)
             failure = error
             raise
+        except GeneratorExit:
+            raise  # Normal closure, not a failure that should outrank cleanup errors.
         except BaseException as error:
             failure = error
             raise
         finally:
-            try:
-                await aclose_owned(events, primary=failure)
-            finally:
-                await self.close()
+            await aclose_owned(events, self, primary=failure)
 
     def with_result_collection(self) -> Self:
         """Beta: retain final messages for a result; call before consuming events."""

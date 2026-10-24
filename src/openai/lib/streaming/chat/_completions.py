@@ -88,15 +88,10 @@ class ChatCompletionStream(Generic[ResponseFormatT]):
 
         Automatically called if the response body is read to completion.
         """
-        try:
-            # A running iterator belongs to its consumer; closing the response ends it.
-            if not getattr(self._iterator, "gi_running", False):
-                close_owned(self._iterator)
-        finally:
-            try:
-                close_owned(self._raw_stream)
-            finally:
-                self._response.close()
+        # Concurrent close does not cancel or join an active consumer; that consumer
+        # closes the iterator when it unwinds.
+        running = getattr(self._iterator, "gi_running", False)
+        close_owned(None if running else self._iterator, self._raw_stream, self._response)
 
     def get_final_completion(self) -> ParsedChatCompletion[ResponseFormatT]:
         """Waits until the stream has been read to completion and returns
@@ -218,15 +213,10 @@ class AsyncChatCompletionStream(Generic[ResponseFormatT]):
 
         Automatically called if the response body is read to completion.
         """
-        try:
-            # A running iterator belongs to its consumer; closing the response ends it.
-            if not getattr(self._iterator, "ag_running", False):
-                await aclose_owned(self._iterator)
-        finally:
-            try:
-                await aclose_owned(self._raw_stream)
-            finally:
-                await self._response.aclose()
+        # Concurrent close does not cancel or join an active consumer; that consumer
+        # closes the iterator when it unwinds.
+        running = getattr(self._iterator, "ag_running", False)
+        await aclose_owned(None if running else self._iterator, self._raw_stream, self._response)
 
     async def get_final_completion(self) -> ParsedChatCompletion[ResponseFormatT]:
         """Waits until the stream has been read to completion and returns

@@ -29,40 +29,58 @@ async def drain_response_async(response: httpx2.Response) -> None:
             await response.aclose()
 
 
-def close_owned(*iterators: object, primary: Optional[BaseException] = None) -> None:
-    """Close iterators this caller opened, in order.
+def _cleanup_error(primary: Optional[BaseException], failure: Optional[BaseException]) -> Optional[BaseException]:
+    """Pick the cleanup failure to raise, if any.
 
-    Every iterator gets its close attempt. Objects without ``close()`` are skipped.
-    A cleanup error is raised only when no ``primary`` error is already propagating.
+    A failure already propagating wins, except that a control-flow exception raised
+    during cleanup (for example cancellation) is never dropped in favor of an ordinary
+    error.
+    """
+    if failure is None:
+        return None
+    if primary is None:
+        return failure
+    if not isinstance(failure, Exception) and isinstance(primary, Exception):
+        return failure
+    return None
+
+
+def close_owned(*resources: object, primary: Optional[BaseException] = None) -> None:
+    """Close resources this caller owns, in order.
+
+    Every resource gets its close attempt; objects without ``close()`` are skipped.
+    The first cleanup failure is raised after all attempts unless ``primary``, the
+    failure already propagating, takes precedence (see ``_cleanup_error``).
     """
     failure: Optional[BaseException] = None
-    for iterator in iterators:
-        close = getattr(iterator, "close", None)
-        if close is None:
-            continue
+    for resource in resources:
         try:
-            close()
-        except Exception as err:
+            close = getattr(resource, "close", None)
+            if close is not None:
+                close()
+        except BaseException as err:  # re-raised below, after the remaining closes
             failure = failure or err
-    if failure is not None and primary is None:
-        raise failure
+    error = _cleanup_error(primary, failure)
+    if error is not None:
+        raise error
 
 
-async def aclose_owned(*iterators: object, primary: Optional[BaseException] = None) -> None:
+async def aclose_owned(*resources: object, primary: Optional[BaseException] = None) -> None:
     """Async counterpart of ``close_owned``.
 
-    Cleanup is shielded from caller cancellation so an already-cancelled scope cannot
-    leave a generator closed with its cleanup half done; cancellation still propagates.
+    The closes are shielded from AnyIO cancellation so an already-cancelled scope cannot
+    leave a resource half closed; cancellation still propagates afterwards. The shield
+    has no deadline, so a closer that never returns blocks the caller.
     """
     failure: Optional[BaseException] = None
     with anyio.CancelScope(shield=True):
-        for iterator in iterators:
-            aclose = getattr(iterator, "aclose", None)
-            if aclose is None:
-                continue
+        for resource in resources:
             try:
-                await aclose()
-            except Exception as err:
+                aclose = getattr(resource, "aclose", None)
+                if aclose is not None:
+                    await aclose()
+            except BaseException as err:  # re-raised below, after the remaining closes
                 failure = failure or err
-    if failure is not None and primary is None:
-        raise failure
+    error = _cleanup_error(primary, failure)
+    if error is not None:
+        raise error

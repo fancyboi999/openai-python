@@ -67,6 +67,8 @@ class Stream(Generic[_T]):
                 raise APITimeoutError(request=self.response.request) from err
             except request_exceptions() as err:
                 raise APIConnectionError(request=self.response.request) from err
+        except GeneratorExit:
+            raise  # Normal closure, not a failure that should outrank cleanup errors.
         except BaseException as err:
             failure = err
             raise
@@ -128,16 +130,15 @@ class Stream(Generic[_T]):
                         cast_to=cast_to,
                         response=response,
                     )
+        except GeneratorExit:
+            raise  # Normal closure, not a failure that should outrank cleanup errors.
         except BaseException as err:
             failure = err
             raise
         finally:
             # Close the event iterator explicitly; stopping at [DONE] leaves it suspended.
-            try:
-                close_owned(iterator, primary=failure)
-            finally:
-                # Ensure the response is closed even if the consumer doesn't read all data
-                response.close()
+            # Ensure the response is closed even if the consumer doesn't read all data.
+            close_owned(iterator, response, primary=failure)
 
     def __enter__(self) -> Self:
         return self
@@ -156,12 +157,10 @@ class Stream(Generic[_T]):
 
         Automatically called if the response body is read to completion.
         """
-        try:
-            # A running iterator belongs to its consumer; closing the response ends it.
-            if not getattr(self._iterator, "gi_running", False):
-                close_owned(self._iterator)
-        finally:
-            self.response.close()
+        # Concurrent close does not cancel or join an active consumer; that consumer
+        # closes the iterator when it unwinds.
+        running = getattr(self._iterator, "gi_running", False)
+        close_owned(None if running else self._iterator, self.response)
 
 
 class AsyncStream(Generic[_T]):
@@ -206,6 +205,8 @@ class AsyncStream(Generic[_T]):
                 raise APITimeoutError(request=self.response.request) from err
             except request_exceptions() as err:
                 raise APIConnectionError(request=self.response.request) from err
+        except GeneratorExit:
+            raise  # Normal closure, not a failure that should outrank cleanup errors.
         except BaseException as err:
             failure = err
             raise
@@ -272,6 +273,8 @@ class AsyncStream(Generic[_T]):
                         cast_to=cast_to,
                         response=response,
                     )
+        except GeneratorExit:
+            raise  # Normal closure, not a failure that should outrank cleanup errors.
         except BaseException as err:
             failure = err
             raise
@@ -279,11 +282,8 @@ class AsyncStream(Generic[_T]):
             # Close the event iterator explicitly. Stopping at [DONE] leaves it and the
             # httpx2 byte iterators beneath it suspended; left to the garbage collector,
             # asyncio closes those nested generators concurrently.
-            try:
-                await aclose_owned(iterator, primary=failure)
-            finally:
-                # Ensure the response is closed even if the consumer doesn't read all data
-                await response.aclose()
+            # Ensure the response is closed even if the consumer doesn't read all data.
+            await aclose_owned(iterator, response, primary=failure)
 
     async def __aenter__(self) -> Self:
         return self
@@ -302,12 +302,10 @@ class AsyncStream(Generic[_T]):
 
         Automatically called if the response body is read to completion.
         """
-        try:
-            # A running iterator belongs to its consumer; closing the response ends it.
-            if not getattr(self._iterator, "ag_running", False):
-                await aclose_owned(self._iterator)
-        finally:
-            await self.response.aclose()
+        # Concurrent close does not cancel or join an active consumer; that consumer
+        # closes the iterator when it unwinds.
+        running = getattr(self._iterator, "ag_running", False)
+        await aclose_owned(None if running else self._iterator, self.response)
 
     async def aclose(self) -> None:
         """Close the response and release the connection. Alias for `close()`."""
