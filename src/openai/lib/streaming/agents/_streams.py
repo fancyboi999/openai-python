@@ -157,6 +157,8 @@ class AgentSessionStream(Generic[OutputT]):
     def __exit__(
         self, exc_type: type[BaseException] | None, exc: BaseException | None, exc_tb: TracebackType | None
     ) -> None:
+        if exc is not None:
+            self._deferred_cleanup_error = None  # The propagating exception wins.
         self.close()
 
     def __iter__(self) -> Self:
@@ -164,6 +166,7 @@ class AgentSessionStream(Generic[OutputT]):
 
     def __next__(self) -> AgentSessionEvent:
         if self._closed:
+            self._raise_deferred_cleanup_error()
             raise StopIteration
         if self._iterator is None:
             raise RuntimeError("Use sessions.stream in a with block")
@@ -211,6 +214,8 @@ class AgentSessionStream(Generic[OutputT]):
             raise
         finally:
             # A cleanup error must not replace the result error being raised.
+            if failure is not None:
+                self._deferred_cleanup_error = None
             close_owned(self, primary=failure)
 
     def close(self) -> None:
@@ -220,6 +225,7 @@ class AgentSessionStream(Generic[OutputT]):
         # closes the iterator when it unwinds.
         running = getattr(self._iterator, "gi_running", False)
         close_owned(None if running else self._iterator, self._stream)
+        self._raise_deferred_cleanup_error()
 
     def _raise_deferred_cleanup_error(self) -> None:
         error, self._deferred_cleanup_error = self._deferred_cleanup_error, None
@@ -325,6 +331,8 @@ class AsyncAgentSessionStream(Generic[OutputT]):
     async def __aexit__(
         self, exc_type: type[BaseException] | None, exc: BaseException | None, exc_tb: TracebackType | None
     ) -> None:
+        if exc is not None:
+            self._deferred_cleanup_error = None  # The propagating exception wins.
         await self.close()
 
     def __aiter__(self) -> Self:
@@ -332,6 +340,7 @@ class AsyncAgentSessionStream(Generic[OutputT]):
 
     async def __anext__(self) -> AgentSessionEvent:
         if self._closed:
+            self._raise_deferred_cleanup_error()
             raise StopAsyncIteration
         if self._iterator is None:
             raise RuntimeError("Use sessions.stream in an async with block")
@@ -379,6 +388,8 @@ class AsyncAgentSessionStream(Generic[OutputT]):
             raise
         finally:
             # A cleanup error must not replace the result error being raised.
+            if failure is not None:
+                self._deferred_cleanup_error = None
             await run_cleanup(self.close, primary=failure)
 
     async def close(self) -> None:
@@ -388,6 +399,7 @@ class AsyncAgentSessionStream(Generic[OutputT]):
         # closes the iterator when it unwinds.
         running = getattr(self._iterator, "ag_running", False)
         await aclose_owned(None if running else self._iterator, self._stream)
+        self._raise_deferred_cleanup_error()
 
     def _raise_deferred_cleanup_error(self) -> None:
         error, self._deferred_cleanup_error = self._deferred_cleanup_error, None

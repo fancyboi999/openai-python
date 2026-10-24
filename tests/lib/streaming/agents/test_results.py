@@ -282,6 +282,68 @@ async def test_terminal_cleanup_error_surfaces_after_successful_result(
         await _final_result_through_stream(sdk)
 
 
+@pytest.mark.parametrize("consume", ["iterate", "until_done", "close_after_terminal"])
+async def test_terminal_cleanup_error_surfaces_once_without_result(
+    sdk: OpenAI | AsyncOpenAI, server: ResultServer, monkeypatch: pytest.MonkeyPatch, consume: str
+) -> None:
+    monkeypatch.setattr(sdk, "_make_sse_decoder", lambda: _CloseFailingDecoder())
+    server.body = EventBody([turn_event("created"), message(), turn_event("completed"), idle()])
+    raised = 0
+    if isinstance(sdk, AsyncOpenAI):
+        async_stream = sdk.beta.agents.sessions.stream("session_test", input="Question")
+        try:
+            async with async_stream:
+                if consume == "iterate":
+                    async for _ in async_stream:
+                        pass
+                elif consume == "until_done":
+                    await async_stream.until_done()
+                else:
+                    async for event in async_stream:
+                        if event.type == "agent.session.idle":
+                            break
+        except RuntimeError as error:
+            assert str(error) == "decoder close failed"
+            raised += 1
+        await async_stream.close()  # Delivered once; a later close does not raise again.
+    else:
+        stream = sdk.beta.agents.sessions.stream("session_test", input="Question")
+        try:
+            with stream:
+                if consume == "iterate":
+                    for _ in stream:
+                        pass
+                elif consume == "until_done":
+                    stream.until_done()
+                else:
+                    for event in stream:
+                        if event.type == "agent.session.idle":
+                            break
+        except RuntimeError as error:
+            assert str(error) == "decoder close failed"
+            raised += 1
+        stream.close()
+    assert raised == 1
+
+
+async def test_context_exception_wins_over_terminal_cleanup_error(
+    sdk: OpenAI | AsyncOpenAI, server: ResultServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sdk, "_make_sse_decoder", lambda: _CloseFailingDecoder())
+    server.body = EventBody([turn_event("created"), message(), turn_event("completed"), idle()])
+    with pytest.raises(KeyError, match="caller"):
+        if isinstance(sdk, AsyncOpenAI):
+            async with sdk.beta.agents.sessions.stream("session_test", input="Question") as async_stream:
+                async for event in async_stream:
+                    if event.type == "agent.session.idle":
+                        raise KeyError("caller")
+        else:
+            with sdk.beta.agents.sessions.stream("session_test", input="Question") as stream:
+                for event in stream:
+                    if event.type == "agent.session.idle":
+                        raise KeyError("caller")
+
+
 @pytest.mark.parametrize("tail", [[], [turn_event("completed")]])
 async def test_incomplete_answer(
     sdk: OpenAI | AsyncOpenAI, server: ResultServer, creation: bool, tail: list[dict[str, Any]]
