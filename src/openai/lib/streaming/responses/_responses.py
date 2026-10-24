@@ -24,7 +24,7 @@ from ....types.responses import (
     ResponseOutputItemDoneEvent,
     ResponseOutputItemAddedEvent,
 )
-from ...._streaming_cleanup import close_owned, aclose_owned
+from ...._streaming_cleanup import close_owned, run_cleanup, aclose_owned
 from ..._parsing._responses import TextFormatT, parse_text, parse_response
 from ....types.responses.tool_param import ToolParam
 from ....types.responses.parsed_response import (
@@ -73,7 +73,8 @@ class ResponseStream(Generic[TextFormatT]):
         exc: BaseException | None,
         exc_tb: TracebackType | None,
     ) -> None:
-        self.close()
+        # A cleanup error must not replace the exception leaving the block.
+        close_owned(self, primary=exc)
 
     def close(self) -> None:
         """
@@ -137,7 +138,8 @@ class ResponseStreamManager(Generic[TextFormatT]):
         exc_tb: TracebackType | None,
     ) -> None:
         if self.__stream is not None:
-            self.__stream.close()
+            # A cleanup error must not replace the exception leaving the block.
+            close_owned(self.__stream, primary=exc)
 
 
 class AsyncResponseStream(Generic[TextFormatT]):
@@ -177,7 +179,8 @@ class AsyncResponseStream(Generic[TextFormatT]):
         exc: BaseException | None,
         exc_tb: TracebackType | None,
     ) -> None:
-        await self.close()
+        # A cleanup error must not replace the exception leaving the block.
+        await run_cleanup(self.close, primary=exc)
 
     async def close(self) -> None:
         """
@@ -241,7 +244,8 @@ class AsyncResponseStreamManager(Generic[TextFormatT]):
         exc_tb: TracebackType | None,
     ) -> None:
         if self.__stream is not None:
-            await self.__stream.close()
+            # A cleanup error must not replace the exception leaving the block.
+            await run_cleanup(self.__stream.close, primary=exc)
 
 
 def _output_identity(

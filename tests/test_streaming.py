@@ -843,6 +843,54 @@ async def test_cleanup_keeps_later_cancellation_over_ordinary_error(sync: bool, 
     assert closed == ["ordinary", "cancelled", "last"]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sync", [True, False], ids=["sync", "async"])
+async def test_context_exit_keeps_caller_exception_over_cleanup_error(
+    sync: bool, client: OpenAI, async_client: AsyncOpenAI
+) -> None:
+    events = _TrackedEvents(close_error=True)
+    with pytest.raises(KeyError, match="caller"):
+        if sync:
+            stream = Stream(cast_to=object, client=client, response=httpx2.Response(200, content=sse_body()))
+            stream._decoder = _TrackedDecoder(events)
+            with stream:
+                next(iter(stream))
+                raise KeyError("caller")
+        else:
+            async_stream = AsyncStream(
+                cast_to=object, client=async_client, response=httpx2.Response(200, content=to_aiter(sse_body()))
+            )
+            async_stream._decoder = _TrackedDecoder(events)
+            async with async_stream:
+                await async_stream.__anext__()
+                raise KeyError("caller")
+    assert events.closes == 1
+
+
+@pytest.mark.asyncio
+async def test_context_exit_keeps_cancellation_over_cleanup_error(async_client: AsyncOpenAI) -> None:
+    events = _TrackedEvents(close_error=True)
+    started = asyncio.Event()
+
+    async def consume() -> None:
+        async_stream = AsyncStream(
+            cast_to=object, client=async_client, response=httpx2.Response(200, content=to_aiter(sse_body()))
+        )
+        async_stream._decoder = _TrackedDecoder(events)
+        async with async_stream:
+            await async_stream.__anext__()
+            started.set()
+            await asyncio.Event().wait()
+
+    task = asyncio.create_task(consume())
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert task.cancelled()
+    assert events.closes == 1
+
+
 async def to_aiter(iter: Iterator[bytes]) -> AsyncIterator[bytes]:
     for chunk in iter:
         yield chunk

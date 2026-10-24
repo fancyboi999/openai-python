@@ -159,7 +159,7 @@ class AgentSessionStream(Generic[OutputT]):
     ) -> None:
         if exc is not None:
             self._deferred_cleanup_error = None  # The propagating exception wins.
-        self.close()
+        close_owned(self, primary=exc)
 
     def __iter__(self) -> Self:
         return self
@@ -333,7 +333,7 @@ class AsyncAgentSessionStream(Generic[OutputT]):
     ) -> None:
         if exc is not None:
             self._deferred_cleanup_error = None  # The propagating exception wins.
-        await self.close()
+        await run_cleanup(self.close, primary=exc)
 
     def __aiter__(self) -> Self:
         return self

@@ -13,7 +13,7 @@ import httpx2
 from ._utils import is_mapping, extract_type_var_from_base
 from ._httpx2 import request_exceptions, timeout_exceptions
 from ._exceptions import APIError, APITimeoutError, APIConnectionError
-from ._streaming_cleanup import close_owned, aclose_owned, drain_response_async
+from ._streaming_cleanup import close_owned, run_cleanup, aclose_owned, drain_response_async
 
 if TYPE_CHECKING:
     from ._client import OpenAI, AsyncOpenAI
@@ -149,7 +149,8 @@ class Stream(Generic[_T]):
         exc: BaseException | None,
         exc_tb: TracebackType | None,
     ) -> None:
-        self.close()
+        # A cleanup error must not replace the exception leaving the block.
+        close_owned(self, primary=exc)
 
     def close(self) -> None:
         """
@@ -294,7 +295,8 @@ class AsyncStream(Generic[_T]):
         exc: BaseException | None,
         exc_tb: TracebackType | None,
     ) -> None:
-        await self.close()
+        # A cleanup error must not replace the exception leaving the block.
+        await run_cleanup(self.close, primary=exc)
 
     async def close(self) -> None:
         """

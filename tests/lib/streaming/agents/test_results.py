@@ -344,6 +344,36 @@ async def test_context_exception_wins_over_terminal_cleanup_error(
                         raise KeyError("caller")
 
 
+async def test_pre_terminal_context_exception_wins_over_cleanup_error(
+    sdk: OpenAI | AsyncOpenAI, server: ResultServer, creation: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sdk, "_make_sse_decoder", lambda: _CloseFailingDecoder())
+    server.body = EventBody([turn_event("created"), message(), turn_event("completed"), idle()])
+    with pytest.raises(KeyError, match="caller"):
+        if isinstance(sdk, AsyncOpenAI):
+            async_stream = (
+                await sdk.beta.agents.sessions.create(
+                    agent={"model": "test-model"}, environment={"type": "none"}, input="Question", stream=True
+                )
+                if creation
+                else sdk.beta.agents.sessions.stream("session_test", input="Question")
+            )
+            async with async_stream:
+                async for _ in async_stream:
+                    raise KeyError("caller")
+        else:
+            stream = (
+                sdk.beta.agents.sessions.create(
+                    agent={"model": "test-model"}, environment={"type": "none"}, input="Question", stream=True
+                )
+                if creation
+                else sdk.beta.agents.sessions.stream("session_test", input="Question")
+            )
+            with stream:
+                for _ in stream:
+                    raise KeyError("caller")
+
+
 @pytest.mark.parametrize("tail", [[], [turn_event("completed")]])
 async def test_incomplete_answer(
     sdk: OpenAI | AsyncOpenAI, server: ResultServer, creation: bool, tail: list[dict[str, Any]]

@@ -38,7 +38,7 @@ from ..._parsing import (
 from ...._streaming import Stream, AsyncStream
 from ....types.chat import ChatCompletionChunk, ParsedChatCompletion, ChatCompletionToolUnionParam
 from ...._exceptions import LengthFinishReasonError, ContentFilterFinishReasonError
-from ...._streaming_cleanup import close_owned, aclose_owned
+from ...._streaming_cleanup import close_owned, run_cleanup, aclose_owned
 from ....types.chat.chat_completion import Moderation, ChoiceLogprobs
 from ....types.chat.chat_completion_chunk import Choice as ChoiceChunk
 from ....types.chat.completion_create_params import ResponseFormat as ResponseFormatParam
@@ -80,7 +80,8 @@ class ChatCompletionStream(Generic[ResponseFormatT]):
         exc: BaseException | None,
         exc_tb: TracebackType | None,
     ) -> None:
-        self.close()
+        # A cleanup error must not replace the exception leaving the block.
+        close_owned(self, primary=exc)
 
     def close(self) -> None:
         """
@@ -166,7 +167,8 @@ class ChatCompletionStreamManager(Generic[ResponseFormatT]):
         exc_tb: TracebackType | None,
     ) -> None:
         if self.__stream is not None:
-            self.__stream.close()
+            # A cleanup error must not replace the exception leaving the block.
+            close_owned(self.__stream, primary=exc)
 
 
 class AsyncChatCompletionStream(Generic[ResponseFormatT]):
@@ -205,7 +207,8 @@ class AsyncChatCompletionStream(Generic[ResponseFormatT]):
         exc: BaseException | None,
         exc_tb: TracebackType | None,
     ) -> None:
-        await self.close()
+        # A cleanup error must not replace the exception leaving the block.
+        await run_cleanup(self.close, primary=exc)
 
     async def close(self) -> None:
         """
@@ -291,7 +294,8 @@ class AsyncChatCompletionStreamManager(Generic[ResponseFormatT]):
         exc_tb: TracebackType | None,
     ) -> None:
         if self.__stream is not None:
-            await self.__stream.close()
+            # A cleanup error must not replace the exception leaving the block.
+            await run_cleanup(self.__stream.close, primary=exc)
 
 
 class ChatCompletionStreamState(Generic[ResponseFormatT]):
