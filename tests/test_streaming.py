@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import gc
 import os
 import ssl
+import sys
 import time
 import socket
 import asyncio
@@ -582,6 +584,40 @@ async def test_async_stream_aclosing(raise_error: bool) -> None:
                     break
 
         assert response.is_closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("early_exit", [False, True], ids=["read-to-done", "early-exit"])
+async def test_async_stream_closes_its_iterators(early_exit: bool, async_client: AsyncOpenAI) -> None:
+    def body() -> Iterator[bytes]:
+        yield b'data: {"foo":true}\n\n'
+        yield b'data: {"bar":false}\n\n'
+        yield b"data: [DONE]\n\n"
+
+    stream = AsyncStream(cast_to=object, client=async_client, response=httpx2.Response(200, content=to_aiter(body())))
+    collected: list[str] = []
+    firstiter, finalizer = sys.get_asyncgen_hooks()
+
+    def record(agen: Any) -> None:
+        collected.append(agen.__qualname__)
+        if finalizer is not None:
+            finalizer(agen)
+
+    # Generators bind the finalizer when first iterated, so install it before iterating.
+    sys.set_asyncgen_hooks(firstiter=firstiter, finalizer=record)
+    try:
+        async for _ in stream:
+            if early_exit:
+                break
+        await stream.close()
+        del stream
+        gc.collect()
+    finally:
+        sys.set_asyncgen_hooks(firstiter=firstiter, finalizer=finalizer)
+
+    # Iterators the stream opened must be closed by the stream, not left to the
+    # garbage collector, where asyncio closes nested generators concurrently.
+    assert [name for name in collected if name.startswith(("AsyncStream.", "SSEDecoder."))] == []
 
 
 async def to_aiter(iter: Iterator[bytes]) -> AsyncIterator[bytes]:
