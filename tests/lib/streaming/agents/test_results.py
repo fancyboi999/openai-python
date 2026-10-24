@@ -6,10 +6,11 @@ from typing_extensions import override
 
 import httpx2
 import pytest
+from pydantic import BaseModel
 
 from openai import OpenAI, AsyncOpenAI
 from openai._streaming import SSEDecoder
-from openai.lib.beta.agents import AgentTurnResult, AgentTurnResultError
+from openai.lib.beta.agents import AgentTurnResult, AgentTurnResultError, AgentOutputParseError
 from openai.lib.streaming.agents import AgentSessionStream, AsyncAgentSessionStream
 from tests.lib.streaming.agents.test_streams import Server, EventBody, sdk as sdk, call, idle, session, turn_event
 
@@ -238,6 +239,47 @@ async def test_cleanup_error_does_not_replace_result_error(
     with pytest.raises(AgentTurnResultError) as exc:
         await collect(sdk, creation)
     assert exc.value.reason == "failed"
+
+
+async def _final_result_through_stream(sdk: OpenAI | AsyncOpenAI, **kwargs: Any) -> Any:
+    if isinstance(sdk, AsyncOpenAI):
+        async with sdk.beta.agents.sessions.stream("session_test", input="Question", **kwargs) as async_stream:
+            return await async_stream.get_final_result()
+    with sdk.beta.agents.sessions.stream("session_test", input="Question", **kwargs) as stream:
+        return stream.get_final_result()
+
+
+async def test_terminal_cleanup_error_does_not_replace_failed_session(
+    sdk: OpenAI | AsyncOpenAI, server: ResultServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sdk, "_make_sse_decoder", lambda: _CloseFailingDecoder())
+    server.body = EventBody(
+        [turn_event("created"), message(), {"type": "agent.session.failed", "session": session("failed")}]
+    )
+    with pytest.raises(AgentTurnResultError) as exc:
+        await _final_result_through_stream(sdk)
+    assert exc.value.reason == "failed"
+
+
+async def test_terminal_cleanup_error_does_not_replace_parse_error(
+    sdk: OpenAI | AsyncOpenAI, server: ResultServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Summary(BaseModel):
+        summary: str
+
+    monkeypatch.setattr(sdk, "_make_sse_decoder", lambda: _CloseFailingDecoder())
+    server.body = EventBody([turn_event("created"), message("not json"), turn_event("completed"), idle()])
+    with pytest.raises(AgentOutputParseError):
+        await _final_result_through_stream(sdk, output_type=Summary)
+
+
+async def test_terminal_cleanup_error_surfaces_after_successful_result(
+    sdk: OpenAI | AsyncOpenAI, server: ResultServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sdk, "_make_sse_decoder", lambda: _CloseFailingDecoder())
+    server.body = EventBody([turn_event("created"), message(), turn_event("completed"), idle()])
+    with pytest.raises(RuntimeError, match="decoder close failed"):
+        await _final_result_through_stream(sdk)
 
 
 @pytest.mark.parametrize("tail", [[], [turn_event("completed")]])
