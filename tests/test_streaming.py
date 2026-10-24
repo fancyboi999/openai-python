@@ -808,6 +808,41 @@ async def test_aclose_owned_closes_every_resource_and_keeps_cancellation() -> No
     assert closed == ["first", "second"]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sync", [True, False], ids=["sync", "async"])
+@pytest.mark.parametrize("primary", [None, ValueError("primary")], ids=["no-primary", "ordinary-primary"])
+async def test_cleanup_keeps_later_cancellation_over_ordinary_error(sync: bool, primary: BaseException | None) -> None:
+    from openai._streaming_cleanup import close_owned, aclose_owned
+
+    closed: list[str] = []
+
+    class Closer:
+        def __init__(self, name: str, error: BaseException | None = None) -> None:
+            self.name = name
+            self.error = error
+
+        def close(self) -> None:
+            closed.append(self.name)
+            if self.error is not None:
+                raise self.error
+
+        async def aclose(self) -> None:
+            self.close()
+
+    resources = (
+        Closer("ordinary", RuntimeError("close failed")),
+        Closer("cancelled", asyncio.CancelledError()),
+        Closer("last"),
+    )
+    with pytest.raises(asyncio.CancelledError):
+        if sync:
+            close_owned(*resources, primary=primary)
+        else:
+            await aclose_owned(*resources, primary=primary)
+
+    assert closed == ["ordinary", "cancelled", "last"]
+
+
 async def to_aiter(iter: Iterator[bytes]) -> AsyncIterator[bytes]:
     for chunk in iter:
         yield chunk

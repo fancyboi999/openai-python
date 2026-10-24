@@ -62,21 +62,27 @@ class AgentSessionEventStream(Stream[AgentSessionEvent], Generic[OutputT]):
         the cached result without consuming more events.
         """
         collector = self._collection.enable()
+        failure: BaseException | None = None
         try:
-            collector.check_outcome(self._dispatcher.handlers if self._dispatcher is not None else ())
-            if not collector.is_done():
-                for _ in self:
-                    collector.check_outcome(self._dispatcher.handlers if self._dispatcher is not None else ())
-                    if collector.is_done():
-                        break
-            return self._collection.result()
-        except (AgentTurnResultError, AgentOutputParseError):
+            try:
+                collector.check_outcome(self._dispatcher.handlers if self._dispatcher is not None else ())
+                if not collector.is_done():
+                    for _ in self:
+                        collector.check_outcome(self._dispatcher.handlers if self._dispatcher is not None else ())
+                        if collector.is_done():
+                            break
+                return self._collection.result()
+            except (AgentTurnResultError, AgentOutputParseError):
+                raise
+            except Exception as error:
+                collector.cause = error
+                raise collector.error("observation_failed") from error
+        except BaseException as error:
+            failure = error
             raise
-        except Exception as error:
-            collector.cause = error
-            raise collector.error("observation_failed") from error
         finally:
-            self.close()
+            # A cleanup error must not replace the result error being raised.
+            close_owned(self, primary=failure)
 
 
 class AsyncAgentSessionEventStream(AsyncStream[AgentSessionEvent], Generic[OutputT]):
@@ -123,18 +129,24 @@ class AsyncAgentSessionEventStream(AsyncStream[AgentSessionEvent], Generic[Outpu
         with_result_collection() before consuming events.
         """
         collector = self._collection.enable()
+        failure: BaseException | None = None
         try:
-            collector.check_outcome(self._dispatcher.handlers if self._dispatcher is not None else ())
-            if not collector.is_done():
-                async for _ in self:
-                    collector.check_outcome(self._dispatcher.handlers if self._dispatcher is not None else ())
-                    if collector.is_done():
-                        break
-            return self._collection.result()
-        except (AgentTurnResultError, AgentOutputParseError):
+            try:
+                collector.check_outcome(self._dispatcher.handlers if self._dispatcher is not None else ())
+                if not collector.is_done():
+                    async for _ in self:
+                        collector.check_outcome(self._dispatcher.handlers if self._dispatcher is not None else ())
+                        if collector.is_done():
+                            break
+                return self._collection.result()
+            except (AgentTurnResultError, AgentOutputParseError):
+                raise
+            except Exception as error:
+                collector.cause = error
+                raise collector.error("observation_failed") from error
+        except BaseException as error:
+            failure = error
             raise
-        except Exception as error:
-            collector.cause = error
-            raise collector.error("observation_failed") from error
         finally:
-            await self.close()
+            # A cleanup error must not replace the result error being raised.
+            await aclose_owned(self, primary=failure)

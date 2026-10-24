@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional, AsyncIterator, cast
+from typing import Any, Callable, Optional, Awaitable, AsyncIterator, cast
 
 import anyio
 import httpx2
@@ -45,6 +45,13 @@ def _cleanup_error(primary: Optional[BaseException], failure: Optional[BaseExcep
     return None
 
 
+def _keep(failure: Optional[BaseException], err: BaseException) -> BaseException:
+    """Keep the first cleanup failure, but let a later control-flow exception replace an ordinary one."""
+    if failure is None or (isinstance(failure, Exception) and not isinstance(err, Exception)):
+        return err
+    return failure
+
+
 def close_owned(*resources: object, primary: Optional[BaseException] = None) -> None:
     """Close resources this caller owns, in order.
 
@@ -59,7 +66,7 @@ def close_owned(*resources: object, primary: Optional[BaseException] = None) -> 
             if close is not None:
                 close()
         except BaseException as err:  # re-raised below, after the remaining closes
-            failure = failure or err
+            failure = _keep(failure, err)
     error = _cleanup_error(primary, failure)
     if error is not None:
         raise error
@@ -80,7 +87,23 @@ async def aclose_owned(*resources: object, primary: Optional[BaseException] = No
                 if aclose is not None:
                     await aclose()
             except BaseException as err:  # re-raised below, after the remaining closes
-                failure = failure or err
+                failure = _keep(failure, err)
+    error = _cleanup_error(primary, failure)
+    if error is not None:
+        raise error
+
+
+async def run_cleanup(cleanup: Callable[[], Awaitable[Any]], *, primary: Optional[BaseException] = None) -> None:
+    """Run one async cleanup callable with the shield and error precedence of ``aclose_owned``.
+
+    For owners whose async close method is not named ``aclose``.
+    """
+    failure: Optional[BaseException] = None
+    with anyio.CancelScope(shield=True):
+        try:
+            await cleanup()
+        except BaseException as err:  # re-raised below according to precedence
+            failure = err
     error = _cleanup_error(primary, failure)
     if error is not None:
         raise error

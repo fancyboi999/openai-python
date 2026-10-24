@@ -8,6 +8,7 @@ import httpx2
 import pytest
 
 from openai import OpenAI, AsyncOpenAI
+from openai._streaming import SSEDecoder
 from openai.lib.beta.agents import AgentTurnResult, AgentTurnResultError
 from openai.lib.streaming.agents import AgentSessionStream, AsyncAgentSessionStream
 from tests.lib.streaming.agents.test_streams import Server, EventBody, sdk as sdk, call, idle, session, turn_event
@@ -193,6 +194,50 @@ async def test_unsuccessful_turn(sdk: OpenAI | AsyncOpenAI, server: ResultServer
     assert exc.value.turn_id == "turn_root"
     assert exc.value.messages[0].output_text == "answer"
     assert server.body.closed
+
+
+class _CloseFailingDecoder(SSEDecoder):
+    """Decodes normally; closing its event iterator fails."""
+
+    class _Events:
+        def __init__(self, inner: Any) -> None:
+            self._inner = inner
+
+        def __iter__(self) -> Any:
+            return self
+
+        def __next__(self) -> Any:
+            return next(self._inner)
+
+        def __aiter__(self) -> Any:
+            return self
+
+        async def __anext__(self) -> Any:
+            return await self._inner.__anext__()
+
+        def close(self) -> None:
+            raise RuntimeError("decoder close failed")
+
+        async def aclose(self) -> None:
+            raise RuntimeError("decoder close failed")
+
+    @override
+    def iter_bytes(self, iterator: Iterator[bytes]) -> Any:
+        return self._Events(super().iter_bytes(iterator))
+
+    @override
+    def aiter_bytes(self, iterator: Any) -> Any:
+        return self._Events(super().aiter_bytes(iterator))
+
+
+async def test_cleanup_error_does_not_replace_result_error(
+    sdk: OpenAI | AsyncOpenAI, server: ResultServer, creation: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sdk, "_make_sse_decoder", lambda: _CloseFailingDecoder())
+    server.body = EventBody([turn_event("created"), message(), turn_event("failed"), idle()])
+    with pytest.raises(AgentTurnResultError) as exc:
+        await collect(sdk, creation)
+    assert exc.value.reason == "failed"
 
 
 @pytest.mark.parametrize("tail", [[], [turn_event("completed")]])

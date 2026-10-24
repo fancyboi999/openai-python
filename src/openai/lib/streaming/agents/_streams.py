@@ -12,6 +12,7 @@ from ._types import ToolHandler, AsyncToolHandler
 from ...._types import Omit, Headers, NotGiven, omit, not_given
 from ._dispatch import ToolDispatcher, AsyncToolDispatcher, _request_options
 from ...._streaming import Stream, AsyncStream
+from ...._streaming_cleanup import close_owned, run_cleanup
 from ...beta.agents._result import (
     OutputT,
     AgentTurnResult,
@@ -146,8 +147,8 @@ class AgentSessionStream(Generic[OutputT]):
             self._sessions.events.create(
                 self._session_id, events=[self._input], idempotency_key=self._idempotency_key, **self._options
             )
-        except BaseException:
-            self.close()
+        except BaseException as error:
+            close_owned(self, primary=error)
             raise
         self._iterator = self._iterate()
         return self
@@ -186,21 +187,27 @@ class AgentSessionStream(Generic[OutputT]):
         To iterate first, call with_result_collection() before consuming events.
         """
         collector = self._collection.enable()
+        failure: BaseException | None = None
         try:
-            collector.check_outcome(self._handlers)
-            if not collector.is_done():
-                for _ in self:
-                    collector.check_outcome(self._handlers)
-                    if collector.is_done():
-                        break
-            return self._collection.result()
-        except (AgentTurnResultError, AgentOutputParseError):
+            try:
+                collector.check_outcome(self._handlers)
+                if not collector.is_done():
+                    for _ in self:
+                        collector.check_outcome(self._handlers)
+                        if collector.is_done():
+                            break
+                return self._collection.result()
+            except (AgentTurnResultError, AgentOutputParseError):
+                raise
+            except Exception as error:
+                self._collection.record_error(error)
+                raise collector.error("observation_failed") from error
+        except BaseException as error:
+            failure = error
             raise
-        except Exception as error:
-            self._collection.record_error(error)
-            raise collector.error("observation_failed") from error
         finally:
-            self.close()
+            # A cleanup error must not replace the result error being raised.
+            close_owned(self, primary=failure)
 
     def close(self) -> None:
         """Close the event connection without cancelling the backend turn."""
@@ -210,6 +217,7 @@ class AgentSessionStream(Generic[OutputT]):
 
     def _iterate(self) -> Iterator[AgentSessionEvent]:
         assert self._stream is not None
+        failure: BaseException | None = None
         try:
             for event in self._stream:
                 if not self._state.accept(event):
@@ -227,9 +235,15 @@ class AgentSessionStream(Generic[OutputT]):
             raise RuntimeError("Session event stream ended before the turn reached idle or failed")
         except Exception as error:
             self._collection.record_error(error)
+            failure = error
+            raise
+        except GeneratorExit:
+            raise  # Normal closure, not a failure that should outrank cleanup errors.
+        except BaseException as error:
+            failure = error
             raise
         finally:
-            self.close()
+            close_owned(self, primary=failure)
 
 
 class AsyncAgentSessionStream(Generic[OutputT]):
@@ -284,8 +298,8 @@ class AsyncAgentSessionStream(Generic[OutputT]):
             await self._sessions.events.create(
                 self._session_id, events=[self._input], idempotency_key=self._idempotency_key, **self._options
             )
-        except BaseException:
-            await self.close()
+        except BaseException as error:
+            await run_cleanup(self.close, primary=error)
             raise
         self._iterator = self._iterate()
         return self
@@ -324,21 +338,27 @@ class AsyncAgentSessionStream(Generic[OutputT]):
         To iterate first, call with_result_collection() before consuming events.
         """
         collector = self._collection.enable()
+        failure: BaseException | None = None
         try:
-            collector.check_outcome(self._handlers)
-            if not collector.is_done():
-                async for _ in self:
-                    collector.check_outcome(self._handlers)
-                    if collector.is_done():
-                        break
-            return self._collection.result()
-        except (AgentTurnResultError, AgentOutputParseError):
+            try:
+                collector.check_outcome(self._handlers)
+                if not collector.is_done():
+                    async for _ in self:
+                        collector.check_outcome(self._handlers)
+                        if collector.is_done():
+                            break
+                return self._collection.result()
+            except (AgentTurnResultError, AgentOutputParseError):
+                raise
+            except Exception as error:
+                self._collection.record_error(error)
+                raise collector.error("observation_failed") from error
+        except BaseException as error:
+            failure = error
             raise
-        except Exception as error:
-            self._collection.record_error(error)
-            raise collector.error("observation_failed") from error
         finally:
-            await self.close()
+            # A cleanup error must not replace the result error being raised.
+            await run_cleanup(self.close, primary=failure)
 
     async def close(self) -> None:
         """Close the event connection without cancelling the backend turn."""
@@ -348,6 +368,7 @@ class AsyncAgentSessionStream(Generic[OutputT]):
 
     async def _iterate(self) -> AsyncIterator[AgentSessionEvent]:
         assert self._stream is not None
+        failure: BaseException | None = None
         try:
             async for event in self._stream:
                 if not self._state.accept(event):
@@ -365,6 +386,12 @@ class AsyncAgentSessionStream(Generic[OutputT]):
             raise RuntimeError("Session event stream ended before the turn reached idle or failed")
         except Exception as error:
             self._collection.record_error(error)
+            failure = error
+            raise
+        except GeneratorExit:
+            raise  # Normal closure, not a failure that should outrank cleanup errors.
+        except BaseException as error:
+            failure = error
             raise
         finally:
-            await self.close()
+            await run_cleanup(self.close, primary=failure)
