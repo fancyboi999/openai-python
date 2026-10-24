@@ -38,6 +38,7 @@ from ..._parsing import (
 from ...._streaming import Stream, AsyncStream
 from ....types.chat import ChatCompletionChunk, ParsedChatCompletion, ChatCompletionToolUnionParam
 from ...._exceptions import LengthFinishReasonError, ContentFilterFinishReasonError
+from ...._streaming_cleanup import close_owned, aclose_owned
 from ....types.chat.chat_completion import Moderation, ChoiceLogprobs
 from ....types.chat.chat_completion_chunk import Choice as ChoiceChunk
 from ....types.chat.completion_create_params import ResponseFormat as ResponseFormatParam
@@ -68,8 +69,7 @@ class ChatCompletionStream(Generic[ResponseFormatT]):
         return self._iterator.__next__()
 
     def __iter__(self) -> Iterator[ChatCompletionStreamEvent[ResponseFormatT]]:
-        for item in self._iterator:
-            yield item
+        return self._iterator
 
     def __enter__(self) -> Self:
         return self
@@ -88,7 +88,15 @@ class ChatCompletionStream(Generic[ResponseFormatT]):
 
         Automatically called if the response body is read to completion.
         """
-        self._response.close()
+        try:
+            # A running iterator belongs to its consumer; closing the response ends it.
+            if not getattr(self._iterator, "gi_running", False):
+                close_owned(self._iterator)
+        finally:
+            try:
+                close_owned(self._raw_stream)
+            finally:
+                self._response.close()
 
     def get_final_completion(self) -> ParsedChatCompletion[ResponseFormatT]:
         """Waits until the stream has been read to completion and returns
@@ -190,9 +198,8 @@ class AsyncChatCompletionStream(Generic[ResponseFormatT]):
     async def __anext__(self) -> ChatCompletionStreamEvent[ResponseFormatT]:
         return await self._iterator.__anext__()
 
-    async def __aiter__(self) -> AsyncIterator[ChatCompletionStreamEvent[ResponseFormatT]]:
-        async for item in self._iterator:
-            yield item
+    def __aiter__(self) -> AsyncIterator[ChatCompletionStreamEvent[ResponseFormatT]]:
+        return self._iterator
 
     async def __aenter__(self) -> Self:
         return self
@@ -211,7 +218,15 @@ class AsyncChatCompletionStream(Generic[ResponseFormatT]):
 
         Automatically called if the response body is read to completion.
         """
-        await self._response.aclose()
+        try:
+            # A running iterator belongs to its consumer; closing the response ends it.
+            if not getattr(self._iterator, "ag_running", False):
+                await aclose_owned(self._iterator)
+        finally:
+            try:
+                await aclose_owned(self._raw_stream)
+            finally:
+                await self._response.aclose()
 
     async def get_final_completion(self) -> ParsedChatCompletion[ResponseFormatT]:
         """Waits until the stream has been read to completion and returns

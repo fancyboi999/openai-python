@@ -24,6 +24,7 @@ from ....types.responses import (
     ResponseOutputItemDoneEvent,
     ResponseOutputItemAddedEvent,
 )
+from ...._streaming_cleanup import close_owned, aclose_owned
 from ..._parsing._responses import TextFormatT, parse_text, parse_response
 from ....types.responses.tool_param import ToolParam
 from ....types.responses.parsed_response import (
@@ -54,8 +55,7 @@ class ResponseStream(Generic[TextFormatT]):
         return self._iterator.__next__()
 
     def __iter__(self) -> Iterator[ResponseStreamEvent[TextFormatT]]:
-        for item in self._iterator:
-            yield item
+        return self._iterator
 
     def __enter__(self) -> Self:
         return self
@@ -81,7 +81,15 @@ class ResponseStream(Generic[TextFormatT]):
 
         Automatically called if the response body is read to completion.
         """
-        self._response.close()
+        try:
+            # A running iterator belongs to its consumer; closing the response ends it.
+            if not getattr(self._iterator, "gi_running", False):
+                close_owned(self._iterator)
+        finally:
+            try:
+                close_owned(self._raw_stream)
+            finally:
+                self._response.close()
 
     def get_final_response(self) -> ParsedResponse[TextFormatT]:
         """Waits until the stream has been read to completion and returns
@@ -155,9 +163,8 @@ class AsyncResponseStream(Generic[TextFormatT]):
     async def __anext__(self) -> ResponseStreamEvent[TextFormatT]:
         return await self._iterator.__anext__()
 
-    async def __aiter__(self) -> AsyncIterator[ResponseStreamEvent[TextFormatT]]:
-        async for item in self._iterator:
-            yield item
+    def __aiter__(self) -> AsyncIterator[ResponseStreamEvent[TextFormatT]]:
+        return self._iterator
 
     async def __stream__(self) -> AsyncIterator[ResponseStreamEvent[TextFormatT]]:
         async for sse_event in self._raw_stream:
@@ -183,7 +190,15 @@ class AsyncResponseStream(Generic[TextFormatT]):
 
         Automatically called if the response body is read to completion.
         """
-        await self._response.aclose()
+        try:
+            # A running iterator belongs to its consumer; closing the response ends it.
+            if not getattr(self._iterator, "ag_running", False):
+                await aclose_owned(self._iterator)
+        finally:
+            try:
+                await aclose_owned(self._raw_stream)
+            finally:
+                await self._response.aclose()
 
     async def get_final_response(self) -> ParsedResponse[TextFormatT]:
         """Waits until the stream has been read to completion and returns

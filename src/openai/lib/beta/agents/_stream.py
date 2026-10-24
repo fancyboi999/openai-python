@@ -6,6 +6,7 @@ from typing_extensions import Self, override
 from ._result import OutputT, AgentTurnResult, AgentTurnResultError, AgentOutputParseError, AgentTurnResultCollection
 from ...._compat import cached_property
 from ...._streaming import Stream, AsyncStream
+from ...._streaming_cleanup import close_owned, aclose_owned
 from ...streaming.agents._dispatch import ToolDispatcher, AsyncToolDispatcher
 from ....types.beta.agent_session_event import AgentSessionEvent
 
@@ -26,8 +27,10 @@ class AgentSessionEventStream(Stream[AgentSessionEvent], Generic[OutputT]):
 
     @override
     def __stream__(self) -> Iterator[AgentSessionEvent]:
+        events = super().__stream__()
+        failure: BaseException | None = None
         try:
-            for event in super().__stream__():
+            for event in events:
                 self._collection.accept(event)
                 pending = self._dispatcher.prepare(event) if self._dispatcher is not None else None
                 yield event
@@ -35,9 +38,16 @@ class AgentSessionEventStream(Stream[AgentSessionEvent], Generic[OutputT]):
                     self._dispatcher.dispatch(pending)
         except Exception as error:
             self._collection.record_error(error)
+            failure = error
+            raise
+        except BaseException as error:
+            failure = error
             raise
         finally:
-            self.close()
+            try:
+                close_owned(events, primary=failure)
+            finally:
+                self.close()
 
     def with_result_collection(self) -> Self:
         """Beta: retain final messages for a result; call before consuming events."""
@@ -81,8 +91,10 @@ class AsyncAgentSessionEventStream(AsyncStream[AgentSessionEvent], Generic[Outpu
 
     @override
     async def __stream__(self) -> AsyncIterator[AgentSessionEvent]:
+        events = super().__stream__()
+        failure: BaseException | None = None
         try:
-            async for event in super().__stream__():
+            async for event in events:
                 self._collection.accept(event)
                 pending = self._dispatcher.prepare(event) if self._dispatcher is not None else None
                 yield event
@@ -90,9 +102,16 @@ class AsyncAgentSessionEventStream(AsyncStream[AgentSessionEvent], Generic[Outpu
                     await self._dispatcher.dispatch(pending)
         except Exception as error:
             self._collection.record_error(error)
+            failure = error
+            raise
+        except BaseException as error:
+            failure = error
             raise
         finally:
-            await self.close()
+            try:
+                await aclose_owned(events, primary=failure)
+            finally:
+                await self.close()
 
     def with_result_collection(self) -> Self:
         """Beta: retain final messages for a result; call before consuming events."""

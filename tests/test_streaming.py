@@ -9,8 +9,8 @@ import socket
 import asyncio
 import importlib
 import threading
-from typing import Any, Iterator, AsyncIterator
-from contextlib import aclosing, nullcontext
+from typing import Any, Iterator, Generator, AsyncIterator
+from contextlib import aclosing, nullcontext, contextmanager
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from typing_extensions import override
 
@@ -20,6 +20,7 @@ import pytest
 
 from openai import OpenAI, AsyncOpenAI, APITimeoutError, APIConnectionError, DefaultAioHttpClient
 from openai._streaming import Stream, AsyncStream, ServerSentEvent
+from openai.types.chat import ChatCompletionChunk
 
 
 @pytest.fixture(
@@ -586,15 +587,12 @@ async def test_async_stream_aclosing(raise_error: bool) -> None:
         assert response.is_closed
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("early_exit", [False, True], ids=["read-to-done", "early-exit"])
-async def test_async_stream_closes_its_iterators(early_exit: bool, async_client: AsyncOpenAI) -> None:
-    def body() -> Iterator[bytes]:
-        yield b'data: {"foo":true}\n\n'
-        yield b'data: {"bar":false}\n\n'
-        yield b"data: [DONE]\n\n"
+@contextmanager
+def gc_finalized_async_generators() -> Generator[list[str], None, None]:
+    """Record async generators that reach the GC finalizer instead of being closed.
 
-    stream = AsyncStream(cast_to=object, client=async_client, response=httpx2.Response(200, content=to_aiter(body())))
+    Generators bind the finalizer on first iteration, so enter this before iterating.
+    """
     collected: list[str] = []
     firstiter, finalizer = sys.get_asyncgen_hooks()
 
@@ -603,21 +601,150 @@ async def test_async_stream_closes_its_iterators(early_exit: bool, async_client:
         if finalizer is not None:
             finalizer(agen)
 
-    # Generators bind the finalizer when first iterated, so install it before iterating.
     sys.set_asyncgen_hooks(firstiter=firstiter, finalizer=record)
     try:
+        yield collected
+    finally:
+        sys.set_asyncgen_hooks(firstiter=firstiter, finalizer=finalizer)
+
+
+# Generators the SDK opens; httpx2-internal ones are owned by httpx2.
+SDK_OWNED = ("AsyncStream.", "SSEDecoder.", "Response.aiter_bytes", "AsyncChatCompletionStream.")
+
+
+def sse_body() -> Iterator[bytes]:
+    yield b'data: {"foo":true}\n\n'
+    yield b'data: {"bar":false}\n\n'
+    yield b"data: [DONE]\n\n"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("early_exit", [False, True], ids=["read-to-done", "early-exit"])
+async def test_async_stream_closes_its_iterators(early_exit: bool, async_client: AsyncOpenAI) -> None:
+    stream = AsyncStream(
+        cast_to=object, client=async_client, response=httpx2.Response(200, content=to_aiter(sse_body()))
+    )
+    with gc_finalized_async_generators() as collected:
         async for _ in stream:
             if early_exit:
                 break
         await stream.close()
         del stream
         gc.collect()
-    finally:
-        sys.set_asyncgen_hooks(firstiter=firstiter, finalizer=finalizer)
 
-    # Iterators the stream opened must be closed by the stream, not left to the
-    # garbage collector, where asyncio closes nested generators concurrently.
-    assert [name for name in collected if name.startswith(("AsyncStream.", "SSEDecoder."))] == []
+    assert [name for name in collected if name.startswith(SDK_OWNED)] == []
+
+
+@pytest.mark.asyncio
+async def test_async_chat_completion_stream_closes_raw_stream_iterators(async_client: AsyncOpenAI) -> None:
+    from openai._types import omit
+    from openai.lib.streaming.chat import AsyncChatCompletionStream
+
+    chunk = b'data: {"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}\n\n'
+    raw = AsyncStream(
+        cast_to=ChatCompletionChunk,
+        client=async_client,
+        response=httpx2.Response(200, content=to_aiter(iter([chunk, chunk, b"data: [DONE]\n\n"]))),
+    )
+    stream = AsyncChatCompletionStream(raw_stream=raw, response_format=omit, input_tools=omit)
+    with gc_finalized_async_generators() as collected:
+        async for _ in stream:
+            break
+        await stream.close()
+        del stream, raw
+        gc.collect()
+
+    assert [name for name in collected if name.startswith(SDK_OWNED)] == []
+
+
+class _TrackedEvents:
+    """A decoder iterator that is not a generator and must be closed exactly once."""
+
+    def __init__(self, fail_after: int | None = None, close_error: bool = False) -> None:
+        self.closes = 0
+        self._sent = 0
+        self._fail_after = fail_after
+        self._close_error = close_error
+
+    def _next(self) -> ServerSentEvent:
+        if self._fail_after is not None and self._sent >= self._fail_after:
+            raise ValueError("decoder failed")
+        self._sent += 1
+        return ServerSentEvent(data='{"foo":true}')
+
+    def __iter__(self) -> "_TrackedEvents":
+        return self
+
+    def __next__(self) -> ServerSentEvent:
+        return self._next()
+
+    def close(self) -> None:
+        self.closes += 1
+        if self._close_error:
+            raise RuntimeError("close failed")
+
+    def __aiter__(self) -> "_TrackedEvents":
+        return self
+
+    async def __anext__(self) -> ServerSentEvent:
+        return self._next()
+
+    async def aclose(self) -> None:
+        self.close()
+
+
+class _TrackedDecoder:
+    def __init__(self, events: _TrackedEvents) -> None:
+        self.events = events
+
+    def iter_bytes(self, iterator: Iterator[bytes]) -> Iterator[ServerSentEvent]:  # noqa: ARG002
+        return self.events
+
+    def aiter_bytes(self, iterator: AsyncIterator[bytes]) -> AsyncIterator[ServerSentEvent]:  # noqa: ARG002
+        return self.events
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sync", [True, False], ids=["sync", "async"])
+async def test_custom_decoder_iterator_is_closed_once(sync: bool, client: OpenAI, async_client: AsyncOpenAI) -> None:
+    events = _TrackedEvents()
+    if sync:
+        stream = Stream(cast_to=object, client=client, response=httpx2.Response(200, content=sse_body()))
+        stream._decoder = _TrackedDecoder(events)
+        next(iter(stream))
+        stream.close()
+    else:
+        async_stream = AsyncStream(
+            cast_to=object, client=async_client, response=httpx2.Response(200, content=to_aiter(sse_body()))
+        )
+        async_stream._decoder = _TrackedDecoder(events)
+        await async_stream.__anext__()
+        await async_stream.close()
+
+    assert events.closes == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sync", [True, False], ids=["sync", "async"])
+async def test_cleanup_error_does_not_replace_stream_error(
+    sync: bool, client: OpenAI, async_client: AsyncOpenAI
+) -> None:
+    events = _TrackedEvents(fail_after=1, close_error=True)
+    with pytest.raises(ValueError, match="decoder failed"):
+        if sync:
+            stream = Stream(cast_to=object, client=client, response=httpx2.Response(200, content=sse_body()))
+            stream._decoder = _TrackedDecoder(events)
+            for _ in stream:
+                pass
+        else:
+            async_stream = AsyncStream(
+                cast_to=object, client=async_client, response=httpx2.Response(200, content=to_aiter(sse_body()))
+            )
+            async_stream._decoder = _TrackedDecoder(events)
+            async for _ in async_stream:
+                pass
+
+    assert events.closes == 1
 
 
 async def to_aiter(iter: Iterator[bytes]) -> AsyncIterator[bytes]:
